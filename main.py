@@ -8,7 +8,46 @@ from langchain_core.output_parsers import StrOutputParser
 
 import os
 from groq import Groq
+import os
+import json
+import urllib.request
+import urllib.error
+from datetime import datetime
 
+
+def send_report_to_discord(question, answer):
+    """오답 신고를 디스코드 웹훅으로 보낸다. 성공하면 True, 실패하면 False."""
+    url = os.environ.get("DISCORD_WEBHOOK_URL")
+    if not url:
+        print("⚠️ DISCORD_WEBHOOK_URL이 설정되지 않아 신고를 보내지 못했습니다.")
+        return False
+
+    # 디스코드 메시지는 2000자 제한 -> 넉넉히 잘라서 보낸다
+    content = (
+        f"🚩 **살레봇 오답 신고** ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})\n"
+        f"**질문:** {question[:300]}\n"
+        f"**답변:**\n{answer[:1400]}"
+    )[:1900]
+
+    data = json.dumps({
+        "content": content,
+        "allowed_mentions": {"parse": []},  # 질문에 @everyone 같은 게 있어도 알림이 울리지 않게
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json", "User-Agent": "SalebotReport/1.0"},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=10)  # 성공하면 디스코드가 204를 돌려줌
+        return True
+    except urllib.error.HTTPError as e:
+        print(f"⚠️ 디스코드 전송 실패 (HTTP {e.code})")
+    except Exception as e:
+        print(f"⚠️ 디스코드 전송 실패: {e}")
+    return False
 client = Groq(
     api_key=os.environ.get("GROQ_API_KEY")
 )
@@ -72,12 +111,11 @@ system_prompt_template = (
     "아래 [학교 메뉴]에 있는 내용을 물어보면 학교 메뉴에 근거해서 한국어로 정확하게 답변해줘."
     "학사일정을 물어봤는데 학사일정이 없으면 정보가 없다고 말하지말고, '오늘은 별도로 일정이 없습니다' 정도의 느낌으로 말해줘"
     "급식이 없는날엔 특이사항에 뭐라고 적혀있다면 '[특이사항] 때문에 별도로 급식이 존재하지 않습니다'의 느낌으로 말해줘'"
-    "긴 글 같은걸 답할때 정형화해서 자연스럽게 다른 이상한 기호 (ex. ------,||| 같은것)들을 다 빼고 깔끔하게 보내줘 급식같은걸 보낼때도 표같은 형식으로 보낼꺼면 칸수 맞춰서 보내기"
     "정보에 없는 내용을 물어보면 상상하지 말고 모른다고 솔직하게 말해.\n\n"
     "[현재 날짜]\n{current_date}\n\n"
     "[학교 정보]\n{context}\n"
     "[학교 메뉴]\n{menu_context}\n"
-)
+)   
 
 prompt = ChatPromptTemplate.from_messages([
     ("system", system_prompt_template),
@@ -98,10 +136,6 @@ def extract_target_dates(user_question, today_obj, last_target_date=None):
         target_dates.append(today_obj + timedelta(days=1))
     if "어제" in user_question:
         target_dates.append(today_obj - timedelta(days=1))
-    if "일주일" in user_question:
-        target_dates.append(today_obj + timedelta(days=7))
-    if "일주일 후" in user_question:
-        target_dates.append(today_obj - timedelta(days=7))
 # [핵심 수정] "그 3일전", "그날부터 3일후"처럼 "그"가 들어간 상대 날짜 표현은
 # "오늘"이 아니라 "직전에 확인했던 날짜"를 기준으로 계산해야 한다.
 # ("그리고", "그래서" 같은 무관한 단어에 오작동하지 않도록 패턴을 좁혀서 검사)
@@ -266,9 +300,152 @@ def simple_keyword_search(user_question, lines, max_chars=KEYWORD_SEARCH_MAX_CHA
 print("\n" + "=" * 50)
 print("🤖 살레봇 (Full-Context + 날짜 사전 하이브리드) 시작")
 print("종료하려면 '종료' 를 입력하세요.")
+print("답변이 틀렸다면 다음 입력창에 '/신고' 를 입력해주세요. (salebot_report.txt에 저장됩니다)")
 print("=" * 50 + "\n")
 
 weekday_list = ['월', '화', '수', '목', '금', '토', '일']
+
+def clean_markdown(text):
+    """마크다운 표/제목/굵게 표시를 일반 텍스트로 바꿔준다."""
+    out, header, last_first = [], None, ""
+    for raw in text.splitlines():
+        line = raw.strip().replace("**", "").replace("__", "")
+        if line.startswith("|"):
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
+                continue  # 표 구분선(|---|---|) 제거
+            if header is None:
+                header = cells
+                continue
+            if cells[0]:
+                last_first = cells[0]
+                out.append(f"\n📅 {last_first}")
+            rest = cells[1:]
+            line_txt = f"  • {rest[0]}: {rest[1]}" if len(rest) >= 2 else f"  • {' / '.join(rest)}"
+            for h, v in zip(header[3:], rest[2:]):
+                if v and v != "없음":
+                    line_txt += f"  [{h}: {v}]"
+            out.append(line_txt)
+            continue
+        header = None
+        if re.fullmatch(r"[-*_]{3,}", line):
+            continue  # --- 구분선 제거
+        line = re.sub(r"^#{1,6}\s*", "", line)  # ### 제목 기호 제거
+        line = re.sub(r"^>\s?", "", line)       # > 인용 기호 제거
+        out.append(line)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+
+# =========================================================================
+# [추가] 월/연 단위 "목록" 질문 처리 (이번달, 다음달, 9월 전체, 올해 ...)
+# 한 달치 급식은 토큰 한도(8,000)를 넘기 때문에 LLM에 보내지 않고,
+# 코드가 데이터에서 직접 꺼내 정리해서 출력한다. (잘림/오류/지연 없음)
+# =========================================================================
+MENU_WORDS = ["급식", "점심", "중식", "저녁", "석식", "밥", "메뉴", "식단"]
+INFO_WORDS = ["일정", "학사", "행사", "시험", "방학", "공지", "뭐 있", "뭐있"]
+# 목록이 아니라 "골라서 답해야 하는" 질문은 기존 방식(LLM)으로 처리
+FILTER_WORDS = ["언제", "나오는", "나와", "중에", "제일", "가장", "몇", "며칠", "어떤 날"]
+YEAR_PATTERN = (r"올해|금년|올\s*한\s*해|한\s*해|이번\s*해|이번\s*(?:년|연)\s*도?|연도|(?<!학)년도"
+                r"|연간|작년|내년|(?<!\d)1\s*년|일\s*년|\d{4}\s*년")
+# 월/일/요일/상대날짜가 같이 들어 있으면 "연 단위"가 아니라 특정 날짜 질문이므로 막지 않는다
+SPECIFIC_DATE_PATTERN = (r"\d{1,2}\s*월|오늘|내일|어제|모레|그날|전날|다음\s*날"
+                         r"|(?:이번|다음|지난|저번|다다음|지지난)\s*주"
+                         r"|\d+\s*(?:일|주)\s*(?:전|후|뒤)|[일이한두삼세]\s*주일?\s*(?:전|후|뒤)")
+
+
+def detect_month_scope(question, today_obj):
+    if re.search(r"이번\s*달", question):
+        return today_obj.year, today_obj.month
+    if re.search(r"다음\s*달", question):
+        return (today_obj.year + 1, 1) if today_obj.month == 12 else (today_obj.year, today_obj.month + 1)
+    if re.search(r"(?:지난|저번)\s*달", question):
+        return (today_obj.year - 1, 12) if today_obj.month == 1 else (today_obj.year, today_obj.month - 1)
+    # "9월", "9월달", "2026년 9월" (뒤에 일자 숫자가 오면 특정 날짜 질문이므로 제외)
+    m = re.search(r"(?:(\d{4})\s*년\s*)?(\d{1,2})\s*월(?:\s*달)?(?!\s*\d)", question)
+    if m and 1 <= int(m.group(2)) <= 12:
+        return (int(m.group(1)) if m.group(1) else today_obj.year), int(m.group(2))
+    return None
+
+
+def format_menu_line(line):
+    d = re.search(r"(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일", line)
+    lunch = re.search(r"식단\s*:\s*(.*?)\.?\s*석식", line, re.S)
+    dinner = re.search(r"석식\s*저녁\s*:\s*(.*?)\.?\s*특이사항", line, re.S)
+    note = re.search(r"특이사항\s*:\s*(.*?)\.?\s*$", line, re.S)
+    if not (d and lunch):
+        return "  • " + line  # 형식이 다르면 원문 그대로
+    out = [f"  • 점심: {lunch.group(1).strip()}"]
+    if dinner:
+        out.append(f"  • 석식: {dinner.group(1).strip()}")
+    if note and note.group(1).strip() not in ("", "없음"):
+        out.append(f"  • 특이사항: {note.group(1).strip()}")
+    return "\n".join(out)
+
+
+def date_header(key):
+    y, m, d = int(key[:4]), int(key[5:7]), int(key[8:10])
+    return f"\n📅 {m}월 {d}일 ({weekday_list[datetime(y, m, d).weekday()]})"
+
+
+def build_month_listing(year, month, want_menu, want_info):
+    prefix = f"{year}년{month:02d}월"
+    sections = []
+    if want_menu:
+        keys = sorted(k for k in menu_date_lookup if k.startswith(prefix))
+        body = [f"🍱 {year}년 {month}월 급식"]
+        for k in keys:
+            body.append(date_header(k))
+            body.extend(format_menu_line(l) for l in menu_date_lookup[k])
+        sections.append("\n".join(body) if keys else f"🍱 {year}년 {month}월 급식 자료가 없습니다.")
+    if want_info:
+        keys = sorted(k for k in info_date_lookup if k.startswith(prefix))
+        body = [f"📚 {year}년 {month}월 학사일정"]
+        for k in keys:
+            body.append(date_header(k))
+            for l in info_date_lookup[k]:
+                text = re.sub(r"^.*?\d{4}년\s*\d{1,2}월\s*\d{1,2}일\s*(?:[월화수목금토일]요일)?\s*:?\s*", "", l) or l
+                body.append("  • " + text)
+        sections.append("\n".join(body) if keys else f"📚 {year}년 {month}월 학사일정 자료가 없습니다.")
+    return "\n\n".join(sections)
+
+
+def handle_bulk_query(question, today_obj):
+    """월/연 단위 목록 질문이면 답변 문자열을, 아니면 None을 반환."""
+    want_menu = any(w in question for w in MENU_WORDS)
+    want_info = any(w in question for w in INFO_WORDS)
+    if not (want_menu or want_info):
+        return None
+
+    scope = detect_month_scope(question, today_obj)
+
+    # 연 단위(올해/이번연도/2026년/1년 전체...)는 정보량이 너무 커서 무조건 막는다.
+    if (not scope and re.search(YEAR_PATTERN, question)
+            and not re.search(SPECIFIC_DATE_PATTERN, question)):
+        return ("연 단위(1년 전체) 조회는 정보량이 너무 많아서 보내드릴 수 없어요 🙏\n"
+                "월 단위로 물어봐 주세요!\n"
+                "  예) '9월 급식', '이번달 학사일정', '다음달 급식이랑 일정'")
+
+    if any(w in question for w in FILTER_WORDS):
+        return None
+    if scope:
+        return build_month_listing(scope[0], scope[1], want_menu, want_info)
+    return None
+
+
+# =========================================================================
+# [추가] 오답 신고 기능: "/신고" 입력 시 직전 질문/답변을 salebot_report.txt에 저장
+# =========================================================================
+REPORT_PATH = "salebot_report.txt"
+last_question = None
+last_answer = None
+
+
+def save_report(question, answer):
+    with open(REPORT_PATH, "a", encoding="utf-8") as f:
+        f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]\n")
+        f.write(f"질문: {question}\n")
+        f.write(f"답변: {answer}\n")
+        f.write("-" * 40 + "\n")
+
 
 while True:
     user_question = input("🙋 질문: ").strip()
@@ -280,6 +457,24 @@ while True:
     if not user_question:
         continue
     
+    # [추가] 오답 신고: 직전 질문/답변을 salebot_report.txt에 저장 (LLM 호출 없음)
+    if user_question == "/신고":
+        if last_question is None:
+            print("🤖 아직 신고할 이전 답변이 없습니다.\n")
+        else:
+            if send_report_to_discord(last_question, last_answer):
+                print("🚩 신고가 접수되었습니다. 감사합니다!\n")
+            else:
+                print("🚩 신고를 보내지 못했습니다. 잠시 후 다시 시도해주세요.\n")
+        continue
+
+    # [추가] 월/연 단위 목록 질문(이번달, 9월 전체, 올해 ...)은 LLM 없이 코드가 직접 답한다.
+    bulk_answer = handle_bulk_query(user_question, datetime.now())
+    if bulk_answer is not None:
+        print(f"\n🤖 살레봇:\n{bulk_answer}\n")
+        last_question, last_answer = user_question, bulk_answer
+        continue
+
     now = datetime.now()
     current_date_str = f"{now.strftime('%Y년 %m월 %d일')} ({weekday_list[now.weekday()]}요일)"
 
@@ -307,4 +502,6 @@ while True:
     raw_usage = (getattr(response, "response_metadata", {}) or {}).get("token_usage", {})
     print(f"🔢 [진단] 토큰 사용량: {usage or raw_usage}")
 
-    print(f"\n🤖 살레봇: {response.content}\n")
+    answer_text = clean_markdown(response.content)
+    print(f"\n🤖 살레봇: {answer_text}\n")
+    last_question, last_answer = user_question, answer_text  # /신고용으로 직전 대화 기억
