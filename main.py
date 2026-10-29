@@ -13,6 +13,10 @@ import json
 import urllib.request
 import urllib.error
 from datetime import datetime
+from auto_sync import sync_if_due, get_context_texts, start_daily_scheduler
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
 def send_report_to_discord(question, answer):
@@ -52,16 +56,29 @@ client = Groq(
     api_key=os.environ.get("GROQ_API_KEY")
 )
 
-# 2. 학교 정보 파일을 "검색" 없이 통째로 읽어서 메모리에 올려둔다.
-#    (=이게 지금 단계의 "학습"에 해당하는 부분. 파일 내용을 그대로 변수에 담아두는 것)
+# 2. 기존 수동 작성 파일을 읽고, 자동 수집 데이터는 SQLite DB에서 불러온다.
+# NEIS_API_KEY가 설정되어 있으면 마지막 수집 후 24시간이 지났을 때 자동 갱신한다.
+try:
+    sync_result = sync_if_due()
+    print(f"🌐 [자동수집] {sync_result}")
+except Exception as exc:
+    print(f"⚠️ [자동수집] 시작 시 수집 실패. 저장된 데이터/수동 파일로 계속 실행합니다: {exc}")
+
+for filename in ("school_info.txt", "school_menu.txt"):
+    if not os.path.exists(filename):
+        open(filename, "a", encoding="utf-8").close()
+
 with open("school_info.txt", "r", encoding="utf-8") as f:
-    school_info = f.read()
-
+    manual_school_info = f.read()
 with open("school_menu.txt", "r", encoding="utf-8") as f:
-    school_menu = f.read()
+    manual_school_menu = f.read()
 
-print(f"📚 [시스템] school_info.txt 로드 완료 (총 {len(school_info)}자)")
-print(f"📚 [시스템] school_menu.txt 로드 완료 (총 {len(school_menu)}자)")
+db_info_text, db_menu_text = get_context_texts()
+school_info = manual_school_info + ("\\n" + db_info_text if db_info_text else "")
+school_menu = manual_school_menu + ("\\n" + db_menu_text if db_menu_text else "")
+
+print(f"📚 [시스템] school_info.txt + DB 로드 완료 (총 {len(school_info)}자)")
+print(f"📚 [시스템] school_menu.txt + DB 로드 완료 (총 {len(school_menu)}자)")
 
 
 # 2-1. [추가] 날짜별 빠른 조회용 사전(dict) 구축
@@ -91,6 +108,21 @@ menu_date_lookup, menu_general_lines = build_date_lookup(school_menu)
 
 print(f"📅 [시스템] 학교 정보 날짜 사전 {len(info_date_lookup)}일치 + 일반 안내 {len(info_general_lines)}줄 구축 완료")
 print(f"📅 [시스템] 급식 날짜 사전 {len(menu_date_lookup)}일치 구축 완료")
+
+def refresh_school_context_from_db():
+    """백그라운드 수집 후 현재 실행 중인 챗봇의 검색 사전도 새로 만든다."""
+    global school_info, school_menu
+    global info_date_lookup, info_general_lines, menu_date_lookup, menu_general_lines
+    db_info, db_menu = get_context_texts()
+    school_info = manual_school_info + ("\\n" + db_info if db_info else "")
+    school_menu = manual_school_menu + ("\\n" + db_menu if db_menu else "")
+    info_date_lookup, info_general_lines = build_date_lookup(school_info)
+    menu_date_lookup, menu_general_lines = build_date_lookup(school_menu)
+    print("🔄 [자동수집] DB 데이터로 검색 사전을 갱신했습니다.")
+
+# 실행 중인 프로세스에서도 하루마다 갱신한다.
+start_daily_scheduler(refresh_school_context_from_db)
+
 
 # 2-2. 데이터 총량은 참고용으로만 출력 (이제 크기와 무관하게 항상
 #    날짜 매칭 또는 키워드 검색으로 필요한 부분만 골라 보내므로, 전체를
@@ -472,6 +504,20 @@ while True:
     if not user_question:
         continue
     
+    # 관리자용 수동 동기화 명령. 배포 환경에서 필요할 때 데이터 갱신을 시험할 수 있다.
+    if user_question == "/동기화":
+        try:
+            from auto_sync import sync_all
+            print(f"🌐 [자동수집] 수동 갱신 결과: {sync_all()}")
+            refresh_school_context_from_db()
+            answer_text = "자동 수집을 실행했습니다. 콘솔의 출처별 결과를 확인해 주세요."
+        except Exception as exc:
+            answer_text = f"자동 수집 중 오류가 발생했습니다: {exc}"
+            print(f"⚠️ {answer_text}")
+        print(f"\n🤖 살레봇: {answer_text}\n")
+        last_question, last_answer = user_question, answer_text
+        continue
+
     # [추가] 오답 신고: 직전 질문/답변을 salebot_report.txt에 저장 (LLM 호출 없음)
     if user_question == "/신고":
         if last_question is None:
@@ -540,7 +586,7 @@ while True:
                 missing_dates.append(target_date.strftime("%Y년 %m월 %d일"))
 
         if direct_lines:
-            answer_text = "\\n".join(f"• {line}" for line in direct_lines)
+            answer_text = "\n".join(f"• {line}" for line in direct_lines)
         else:
             missing_text = ", ".join(missing_dates)
             answer_text = (
@@ -548,7 +594,7 @@ while True:
                 "일정이 없는 날인지 자료가 누락된 것인지 확인이 필요합니다."
             )
 
-        print(f"\\n🤖 살레봇: {answer_text}\\n")
+        print(f"\n🤖 살레봇: {answer_text}\n")
         last_question, last_answer = user_question, answer_text
         continue
 
