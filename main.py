@@ -111,8 +111,13 @@ system_prompt_template = (
     "아래 [학교 메뉴]에 있는 내용을 물어보면 학교 메뉴에 근거해서 한국어로 정확하게 답변해줘."
     "학사일정을 물어봤는데 학사일정이 없으면 정보가 없다고 말하지말고, '오늘은 별도로 일정이 없습니다' 정도의 느낌으로 말해줘"
     "급식이 없는날엔 특이사항에 뭐라고 적혀있다면 '[특이사항] 때문에 별도로 급식이 존재하지 않습니다'의 느낌으로 말해줘'"
-    "정보에 없는 내용을 물어보면 상상하지 말고 모른다고 솔직하게 말해.\n\n"
-    "[현재 날짜]\n{current_date}\n\n"
+    "정보에 없는 내용을 물어보면 상상하지 말고 모른다고 솔직하게 말해. "
+    "중요: 질문에 '10월 30일'처럼 구체적인 날짜가 있으면 [현재 날짜]보다 질문에 적힌 날짜를 우선해. "
+    "'오늘'이라는 단어가 함께 있어도 구체적인 날짜를 임의로 현재 날짜로 바꾸지 마. "
+    "[조회 대상 날짜]에 적힌 날짜의 학교 자료만 근거로 답하고, 다른 날짜 자료를 섞지 마. "
+    "조회 대상 날짜의 자료가 제공되어 있으면 그 자료를 확인해서 답해.\n\n"
+    "[현재 날짜]\n{current_date}\n"
+    "[조회 대상 날짜]\n{target_date_text}\n\n"
     "[학교 정보]\n{context}\n"
     "[학교 메뉴]\n{menu_context}\n"
 )   
@@ -128,100 +133,112 @@ chain = prompt | llm  # [진단용 변경] 토큰 사용량 확인을 위해 Str
 # [추가] 질문에서 날짜를 찾아, 있으면 두 사전에서 각각 그 줄만 빠르게 꺼내고
 # (전체 문맥 모드거나 날짜를 못 찾으면) 기존처럼 전체를 그대로 넣는다.
 def extract_target_dates(user_question, today_obj, last_target_date=None):
+    """질문에서 대상 날짜를 추출한다.
+
+    우선순위:
+    1) 질문에 명시된 날짜(예: 오늘 10월 30일 일정) 우선
+    2) 오늘/내일/어제/모레는 실제 오늘 날짜 기준
+    3) 그 다음날/그 전날은 직전에 조회한 날짜 기준
+    4) N일 뒤/일주일 뒤 등은 직전 조회 날짜가 있으면 그 날짜 기준
+    5) 이번 주/다음 주 등은 실제 오늘 날짜 기준
+    """
+    question = re.sub(r"\s+", " ", user_question).strip()
     target_dates = []
 
-    if "오늘" in user_question:
-        target_dates.append(today_obj)
-    if "내일" in user_question:
-        target_dates.append(today_obj + timedelta(days=1))
-    if "어제" in user_question:
-        target_dates.append(today_obj - timedelta(days=1))
-# [핵심 수정] "그 3일전", "그날부터 3일후"처럼 "그"가 들어간 상대 날짜 표현은
-# "오늘"이 아니라 "직전에 확인했던 날짜"를 기준으로 계산해야 한다.
-# ("그리고", "그래서" 같은 무관한 단어에 오작동하지 않도록 패턴을 좁혀서 검사)
-    refers_to_last_date = bool(re.search(r"그날|그때|그로부터|그\s", user_question))
-    base_date = last_target_date if (refers_to_last_date and last_target_date is not None) else today_obj
+    # 1. 명시적인 날짜가 있으면 '오늘' 같은 표현보다 먼저 처리한다.
+    # 예: "오늘 10월 30일 일정", "2026년 10월 30일 학사일정"
+    explicit = re.search(
+        r"(?:(\d{4})\s*년\s*)?(\d{1,2})\s*월\s*(\d{1,2})\s*일",
+        question
+    )
+    if explicit:
+        year = int(explicit.group(1)) if explicit.group(1) else today_obj.year
+        month = int(explicit.group(2))
+        day = int(explicit.group(3))
+        try:
+            return [datetime(year, month, day)]
+        except ValueError:
+            # 잘못된 날짜라면 임의로 다른 날짜를 만들지 않는다.
+            return []
 
-    # [추가] "N일 전", "N일 뒤/후" 같은 상대 날짜 표현 (기준일: base_date)
-    m_before = re.search(r"(\d+)\s*일\s*전", user_question)
+    # 2. 절대적인 상대 날짜 표현은 항상 실제 오늘 날짜 기준이다.
+    # 이전 대화에서 다른 날짜를 조회했더라도 "내일"은 오늘의 다음 날이다.
+    if re.search(r"모레", question):
+        return [today_obj + timedelta(days=2)]
+    if re.search(r"내일", question):
+        return [today_obj + timedelta(days=1)]
+    if re.search(r"어제", question):
+        return [today_obj - timedelta(days=1)]
+    if re.search(r"오늘", question):
+        return [today_obj]
+
+    # 3. 직전 조회 날짜를 가리키는 표현
+    if last_target_date is not None:
+        if re.search(r"그\s*다음\s*날|그다음날|다음\s*날|다음날", question):
+            return [last_target_date + timedelta(days=1)]
+        if re.search(r"그\s*전\s*날|그전날|전\s*날|전날", question):
+            return [last_target_date - timedelta(days=1)]
+        if re.search(r"그\s*날|그날", question):
+            return [last_target_date]
+
+    # 4. 일/주 단위 상대 날짜. 문맥상 직전 날짜가 있으면 그것을 기준으로 한다.
+    relative_base = last_target_date or today_obj
+    m_before = re.search(r"(\d+)\s*일\s*전", question)
     if m_before:
-        target_dates.append(base_date - timedelta(days=int(m_before.group(1))))
+        return [relative_base - timedelta(days=int(m_before.group(1)))]
 
-    m_after = re.search(r"(\d+)\s*일\s*(?:뒤|후)", user_question)
+    m_after = re.search(r"(\d+)\s*일\s*(?:뒤|후|후에)", question)
     if m_after:
-        target_dates.append(base_date + timedelta(days=int(m_after.group(1))))
+        return [relative_base + timedelta(days=int(m_after.group(1)))]
 
-    # [추가] "일주일 전", "이주일 전", "3주 전", "3주일 후" 같은 "주" 단위 상대 날짜 (기준일: base_date)
-    korean_num_map = {"한": 1, "일": 1, "이": 2, "두": 2, "삼": 3, "세": 3, "사": 4, "네": 4, "오": 5, "다섯": 5}
-
-    m_week_before = re.search(r"(\d+|[가-힣])\s*주(?:일)?\s*전", user_question)
+    korean_num_map = {
+        "한": 1, "일": 1, "이": 2, "두": 2, "삼": 3, "세": 3,
+        "사": 4, "네": 4, "오": 5, "다섯": 5
+    }
+    m_week_before = re.search(r"(\d+|다섯|한|일|이|두|삼|세|사|네|오)\s*주(?:일)?\s*전", question)
     if m_week_before:
         raw = m_week_before.group(1)
         weeks = int(raw) if raw.isdigit() else korean_num_map.get(raw, 1)
-        target_dates.append(base_date - timedelta(weeks=weeks))
+        return [relative_base - timedelta(weeks=weeks)]
 
-    m_week_after = re.search(r"(\d+|[가-힣])\s*주(?:일)?\s*(?:뒤|후)", user_question)
+    m_week_after = re.search(r"(\d+|다섯|한|일|이|두|삼|세|사|네|오)\s*주(?:일)?\s*(?:뒤|후|후에)", question)
     if m_week_after:
         raw = m_week_after.group(1)
         weeks = int(raw) if raw.isdigit() else korean_num_map.get(raw, 1)
-        target_dates.append(base_date + timedelta(weeks=weeks))
+        return [relative_base + timedelta(weeks=weeks)]
 
-    # [추가] "다음주"/"이번주" (+ 특정 요일) 표현
-    # 요일까지 지정하면 그 날짜 하나만, 요일 없이 "다음주 급식 알려줘"처럼 물으면
-    # 그 주 7일 전체를 대상 날짜로 넣는다 (있는 날짜만 나중에 자동으로 골라짐).
+    # 5. 이번 주/다음 주/지난 주 + 요일. 이 표현은 오늘이 속한 주를 기준으로 한다.
     weekday_map = {'월': 0, '화': 1, '수': 2, '목': 3, '금': 4, '토': 5, '일': 6}
     this_week_monday = today_obj - timedelta(days=today_obj.weekday())
-
-    # 주의: "다다음주"는 "다음주"를 포함하고 있으므로 반드시 더 긴 표현부터 검사한다.
     week_offset = None
-    if re.search(r"다\s*다\s*음\s*주", user_question):
+    if re.search(r"다\s*다\s*음\s*주", question):
         week_offset = 2
-    elif re.search(r"다음\s*주", user_question):
+    elif re.search(r"다음\s*주", question):
         week_offset = 1
-    elif re.search(r"이번\s*주", user_question):
+    elif re.search(r"이번\s*주", question):
         week_offset = 0
-    elif re.search(r"지지난\s*주", user_question):
+    elif re.search(r"지지난\s*주", question):
         week_offset = -2
-    elif re.search(r"(?:지난|저번)\s*주", user_question):
+    elif re.search(r"(?:지난|저번)\s*주", question):
         week_offset = -1
 
-    week_start = None
     if week_offset is not None:
         week_start = this_week_monday + timedelta(weeks=week_offset)
-
-    if week_start is not None:
         matched_weekday = None
         for name, idx in weekday_map.items():
-            if f"{name}요일" in user_question:
+            if f"{name}요일" in question:
                 matched_weekday = idx
                 break
         if matched_weekday is not None:
-            target_dates.append(week_start + timedelta(days=matched_weekday))
-        else:
-            target_dates.extend(week_start + timedelta(days=i) for i in range(7))
+            return [week_start + timedelta(days=matched_weekday)]
+        return [week_start + timedelta(days=i) for i in range(7)]
 
-    # [추가] "그날", "그 다음날", "그 전날" 처럼 오늘이 아니라 "직전에 물어본 날짜"를
-    # 기준으로 삼는 표현. 예: "9월14일 급식" 물어본 다음 "그 다음날 급식"이라고 하면
-    # last_target_date(=9월14일) + 1일로 계산한다.
-    if not target_dates and last_target_date is not None:
-        if re.search(r"다음\s*날|다음날", user_question):
-            target_dates.append(last_target_date + timedelta(days=1))
-        elif re.search(r"전\s*날|전날", user_question):
-            target_dates.append(last_target_date - timedelta(days=1))
-        elif "그날" in user_question or "그 날" in user_question:
-            target_dates.append(last_target_date)
-
-    if not target_dates:
-        m = re.search(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일", user_question)
-        if m:
-            mm, dd = int(m.group(1)), int(m.group(2))
-            target_dates.append(datetime(year=today_obj.year, month=mm, day=dd))
-
-    return target_dates
+    # 6. 날짜를 찾지 못했으면 빈 목록을 반환해 일반 키워드 검색으로 넘긴다.
+    return []
 
 
-def build_context(user_question, today_obj):
-    target_dates = extract_target_dates(user_question, today_obj)
+def build_context(user_question, today_obj, last_target_date=None):
+    target_dates = extract_target_dates(user_question, today_obj, last_target_date)
 
     if target_dates:
         date_keys = [d.strftime("%Y년%m월%d일") for d in target_dates]
@@ -233,29 +250,26 @@ def build_context(user_question, today_obj):
             info_lines.extend(info_date_lookup.get(key, []))
             menu_lines.extend(menu_date_lookup.get(key, []))
 
-        # 찾은 날짜 줄 + 날짜 없는 "일반 안내"만 합쳐서 보낸다.
-        # -> 데이터가 몇 달치로 늘어나도 항상 가벼운 상태 유지.
+        # 날짜별 자료가 없더라도 일반 안내는 함께 전달한다.
         context_parts = info_lines + info_general_lines
         context = "\n".join(context_parts) if context_parts else "\n".join(info_general_lines)
 
-        # 급식은 하루 단위로 딱 떨어지는 포맷이라, 못 찾으면 "정보 없음"이라고 명시.
         if menu_lines:
             menu_context = "\n".join(menu_lines)
         else:
             menu_context = f"[참고: {', '.join(date_labels)}에 해당하는 급식 정보가 school_menu.txt에 없음]"
 
-        return context, menu_context
+        # 대상 날짜도 반환해 다음 질문의 '그 다음날' 등에 활용한다.
+        return context, menu_context, target_dates
 
-    # [핵심 변경] 날짜가 없는 일반 질문이라고 해서 전체를 다 보내지 않는다.
-    # 학교 정보/급식 데이터 "전체" 중에서 질문과 관련도 높은 줄만 키워드 검색으로 골라 보낸다.
-    # (모든 줄이 검색 대상이라 정보 손실은 없고, 실제로 보내는 양만 항상 작게 유지된다)
+    # 날짜가 없는 질문은 전체 자료에서 관련도가 높은 줄을 검색한다.
     all_info_lines = info_general_lines + [line for lines in info_date_lookup.values() for line in lines]
     all_menu_lines = [line for lines in menu_date_lookup.values() for line in lines]
 
     context = simple_keyword_search(user_question, all_info_lines) or "\n".join(info_general_lines)
     menu_context = simple_keyword_search(user_question, all_menu_lines) or "질문과 관련된 급식 정보를 찾지 못했습니다."
 
-    return context, menu_context
+    return context, menu_context, []
 
 
 # [교체] 눈 감고 앞부분만 자르는 clip_text 대신, 질문과 겹치는 단어가 많은 줄부터
@@ -437,6 +451,7 @@ def handle_bulk_query(question, today_obj):
 REPORT_PATH = "salebot_report.txt"
 last_question = None
 last_answer = None
+last_target_date = None
 
 
 def save_report(question, answer):
@@ -480,21 +495,62 @@ while True:
 
     # [추가] 어디서 시간이 드는지 직접 측정: 딕셔너리 조회 vs LLM 응답
     t0 = time.perf_counter()
-    context, menu_context = build_context(user_question, now)
+    context, menu_context, queried_dates = build_context(user_question, now, last_target_date)
+    if queried_dates:
+        last_target_date = queried_dates[-1]
     t1 = time.perf_counter()
 
     print(f"🔍 [진단] 컨텍스트 검색 소요 시간: {t1 - t0:.4f}초 "
           f"(학교정보 {len(context)}자 + 급식 {len(menu_context)}자 전송 예정)")
+    if queried_dates:
+        target_date_text = ", ".join(d.strftime("%Y년 %m월 %d일") for d in queried_dates)
+        print(f"🗓️ [진단] 실제 조회 대상 날짜: {target_date_text}")
+        print(f"🗓️ [진단] 일정 자료 일치 줄 수: {sum(len(info_date_lookup.get(d.strftime('%Y년%m월%d일'), [])) for d in queried_dates)}")
+        print(f"🗓️ [진단] 급식 자료 일치 줄 수: {sum(len(menu_date_lookup.get(d.strftime('%Y년%m월%d일'), [])) for d in queried_dates)}")
+    else:
+        target_date_text = "질문에서 특정 날짜를 지정하지 않음"
 
     response = chain.invoke({
         "question": user_question,
         "context": context,
         "menu_context": menu_context,
         "current_date": current_date_str,
+        "target_date_text": target_date_text,
     })
     t2 = time.perf_counter()
 
     print(f"⏱️ [진단] LLM 응답 소요 시간: {t2 - t1:.4f}초")
+
+    # [수정] 날짜가 정해진 학사일정 질문은 LLM의 추측/오해를 거치지 않고
+    # 해당 날짜의 school_info.txt 원문을 직접 반환한다.
+    # 예: "오늘 학사일정", "오늘 일정", "오늘 10월 29일 학사일정"
+    is_schedule_query = any(
+        word in user_question for word in ["학사일정", "일정", "행사", "시험", "방학"]
+    )
+    if queried_dates and is_schedule_query:
+        direct_lines = []
+        missing_dates = []
+
+        for target_date in queried_dates:
+            key = target_date.strftime("%Y년%m월%d일")
+            date_lines = info_date_lookup.get(key, [])
+            if date_lines:
+                direct_lines.extend(date_lines)
+            else:
+                missing_dates.append(target_date.strftime("%Y년 %m월 %d일"))
+
+        if direct_lines:
+            answer_text = "\\n".join(f"• {line}" for line in direct_lines)
+        else:
+            missing_text = ", ".join(missing_dates)
+            answer_text = (
+                f"{missing_text} 학사일정 자료를 school_info.txt에서 찾지 못했습니다. "
+                "일정이 없는 날인지 자료가 누락된 것인지 확인이 필요합니다."
+            )
+
+        print(f"\\n🤖 살레봇: {answer_text}\\n")
+        last_question, last_answer = user_question, answer_text
+        continue
 
     # [추가] 실제 사용된 토큰 수를 출력해서, 느려진 게 "토큰을 많이 만들어서"인지
     # 아니면 "토큰 수와 무관한 API/네트워크 지연"인지 구분한다.
