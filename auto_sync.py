@@ -24,7 +24,7 @@ except ImportError:
 DB_PATH = os.getenv("SALEBOT_DB_PATH", "school_data.db")
 SCHOOL_NAME = os.getenv("SCHOOL_NAME", "살레시오고등학교")
 ATPT_CODE = os.getenv("NEIS_ATPT_CODE", "F10")  # 광주광역시교육청 코드
-SCHOOL_HOME = os.getenv("SCHOOL_HOME_URL", "http://salesio.gen.hs.kr/")
+SCHOOL_HOME = os.getenv("SCHOOL_HOME_URL", "https://salesio.jge.hs.kr/main/main.php")
 NEIS_KEY = os.getenv("NEIS_API_KEY", "").strip()
 SYNC_INTERVAL_SECONDS = int(os.getenv("SYNC_INTERVAL_SECONDS", "86400"))
 REQUEST_TIMEOUT = int(os.getenv("DATA_REQUEST_TIMEOUT", "15"))
@@ -146,8 +146,7 @@ def _fetch_json(endpoint, params):
 
 
 def _find_school():
-    rows = _fetch_json("SchoolInfo", {
-        "ATPT_OFCDC_SC_CODE": ATPT_CODE,
+    rows = _fetch_json("schoolInfo", {
         "SCHUL_NM": SCHOOL_NAME,
     })
     # 학교명 완전 일치 우선
@@ -328,64 +327,150 @@ def _clean_html(html):
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).strip()
 
 
+
 def _crawl_official_site():
     """
-    사이트 구조를 알 수 없을 때의 범용 크롤러.
-    홈페이지에서 공지/가정통신문으로 보이는 링크를 찾아 페이지 본문을 저장합니다.
-    사이트가 JavaScript로만 렌더링되거나 접근을 차단하면 수집이 제한될 수 있습니다.
+    살레시오고등학교 공식 홈페이지의
+    학생공지, 학교공지, 가정통신문을 수집합니다.
     """
     if not SCHOOL_HOME:
         return 0
-    if BeautifulSoup is None:
-        raise RuntimeError("학교 홈페이지 크롤링에는 beautifulsoup4 설치가 필요합니다.")
 
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; SalebotSchoolInfo/1.0)"}
-    req = Request(SCHOOL_HOME, headers=headers)
-    with urlopen(req, timeout=REQUEST_TIMEOUT) as response:
-        html = response.read().decode("utf-8", errors="replace")
-    soup = BeautifulSoup(html, "html.parser")
-    base_host = urlparse(SCHOOL_HOME).netloc
-    candidates = []
-    keywords = ("공지", "가정통신문", "알림", "행사", "학사일정", "학교소식", "안내")
-    for a in soup.find_all("a", href=True):
-        label = re.sub(r"\s+", " ", a.get_text(" ", strip=True)).strip()
-        href = urljoin(SCHOOL_HOME, a["href"])
-        if not label or len(label) > 180:
-            continue
-        if urlparse(href).netloc != base_host:
-            continue
-        if any(k in label for k in keywords):
-            candidates.append((label, href))
-    # 링크 중복 제거, 홈페이지 및 메뉴 링크 수 제한
-    seen = set()
-    unique = []
-    for label, url in candidates:
-        if url not in seen:
-            seen.add(url)
-            unique.append((label, url))
+    if BeautifulSoup is None:
+        raise RuntimeError("beautifulsoup4 설치가 필요합니다.")
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+    base_url = "https://salesio.jge.hs.kr"
+
+    boards = [
+        ("학생공지", 25),
+        ("학교공지", 43),
+        ("가정통신문", 44),
+    ]
+
     records = []
-    for label, url in unique[:20]:
+    seen = set()
+
+    for category, tbnum in boards:
+        board_url = f"{base_url}/xboard/board.php?tbnum={tbnum}"
+
         try:
-            req = Request(url, headers=headers)
+            req = Request(board_url, headers=headers)
             with urlopen(req, timeout=REQUEST_TIMEOUT) as response:
-                page = response.read().decode("utf-8", errors="replace")
-            body = _clean_html(page)
-            if len(body) < 40:
-                continue
-            category = "가정통신문" if "가정통신문" in label else "학교공지"
-            records.append({
-                "category": category, "record_date": "",
-                "title": label, "content": body[:12000], "url": url,
-                "source": "학교 공식 홈페이지",
-            })
+                html = response.read().decode("utf-8", errors="replace")
+
+            soup = BeautifulSoup(html, "html.parser")
+
+            # 게시글 상세 페이지 링크 수집
+            links = []
+
+            for a in soup.select("a[href]"):
+                href = a.get("href", "")
+
+                if "mode=view" not in href or "number=" not in href:
+                    continue
+
+                detail_url = urljoin(board_url, href)
+
+                if f"tbnum={tbnum}" not in detail_url:
+                    continue
+
+                if detail_url not in seen:
+                    seen.add(detail_url)
+                    links.append(detail_url)
+
+            # 게시판별 최신 게시글 최대 15개
+            for detail_url in links[:15]:
+                try:
+                    req = Request(detail_url, headers=headers)
+
+                    with urlopen(req, timeout=REQUEST_TIMEOUT) as response:
+                        page = response.read().decode(
+                            "utf-8", errors="replace"
+                        )
+
+                    detail = BeautifulSoup(page, "html.parser")
+
+                    view = detail.select_one("#xb_view")
+                    if not view:
+                        continue
+
+                    info = view.select_one(".new_board_view")
+                    body = view.select_one(".board_content")
+
+                    if not info:
+                        continue
+
+
+                    # 게시글 제목
+                    title_tag = info.select_one("h4.title")
+                    title = ""
+
+                    if title_tag:
+                        title_tag.select_one("p.indent").decompose() if title_tag.select_one("p.indent") else None
+                        title = title_tag.get_text(" ", strip=True)
+
+                    # 게시글 본문
+                    content_tag = view.select_one(
+                        ".board_content .board_img_view_con"
+                    )
+
+                    content = (
+                        content_tag.get_text(" ", strip=True)
+                        if content_tag else ""
+                    )
+
+                    # 작성일
+                    record_date = ""
+
+                    for li in info.select("ul.v_info li"):
+                        label = li.find("span")
+                        if label and "작성일" in label.get_text(strip=True):
+                            date_match = re.search(
+                                r"\d{4}-\d{2}-\d{2}",
+                                li.get_text(" ", strip=True)
+                            )
+                            if date_match:
+                                record_date = date_match.group(0)
+                            break
+
+
+                    if not title:
+                        continue
+
+                    records.append({
+                        "category": category,
+                        "record_date": record_date,
+                        "title": title[:300],
+                        "content": content[:12000],
+                        "url": detail_url,
+                        "source": "살레시오고등학교 공식 홈페이지",
+                    })
+
+                except Exception as exc:
+                    LOG.warning(
+                        "게시글 수집 실패 (%s): %s",
+                        detail_url, exc
+                    )
+
         except Exception as exc:
-            LOG.warning("홈페이지 링크 수집 실패 (%s): %s", url, exc)
+            LOG.warning(
+                "%s 게시판 접속 실패: %s",
+                category, exc
+            )
+
     if records:
         _upsert_records(records)
-        _mark_success("official_site", f"{len(records)}개 페이지 저장")
+        _mark_success(
+            "official_site",
+            f"{len(records)}개 게시글 저장"
+        )
+        LOG.info("홈페이지 게시글 %s개 수집 완료", len(records))
     else:
-        LOG.warning("홈페이지에서 공지/가정통신문을 찾지 못했습니다. 기존 DB를 유지합니다.")
+        LOG.warning("홈페이지에서 게시글을 수집하지 못했습니다.")
+
     return len(records)
+
 
 
 def sync_all():
