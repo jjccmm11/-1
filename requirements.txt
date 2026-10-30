@@ -1,0 +1,5 @@
+langchain-groq
+langchain-core
+groq
+requests
+beautifulsoup4
